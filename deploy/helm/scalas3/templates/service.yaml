@@ -1,0 +1,23 @@
+# ノード同士が名前で引けるようにするためのヘッドレスサービス
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-peers
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - { name: rpc, port: 3901 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - { name: s3, port: 3900 }
+    - { name: admin, port: 3903 }

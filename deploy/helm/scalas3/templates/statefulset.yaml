@@ -1,0 +1,80 @@
+{{- $name := .Release.Name -}}
+{{- $peers := list -}}
+{{- range $i := until (int .Values.replicas) -}}
+{{- $peers = append $peers (printf "%s-%d=%s-%d.%s-peers:3901" $name $i $name $i $name) -}}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+spec:
+  serviceName: {{ $name }}-peers
+  replicas: {{ .Values.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+    spec:
+      {{- with .Values.podSecurityContext }}
+      securityContext: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: scalas3
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - { name: s3, containerPort: 3900 }
+            - { name: rpc, containerPort: 3901 }
+            - { name: admin, containerPort: 3903 }
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: SCALAS3_NODE_ID, value: "$(POD_NAME)" }
+            - { name: SCALAS3_RPC_ADVERTISE, value: "$(POD_NAME).{{ $name }}-peers:3901" }
+            - { name: SCALAS3_PEERS, value: {{ join "," $peers | quote }} }
+            - { name: SCALAS3_COPIES, value: {{ .Values.copies | quote }} }
+            - { name: SCALAS3_REPLICAS, value: {{ .Values.metadataReplicas | quote }} }
+            - { name: SCALAS3_STORAGE_CLASSES, value: {{ .Values.storageClasses | quote }} }
+            - name: SCALAS3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret }}, key: accessKey } }
+            - name: SCALAS3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret }}, key: secretKey } }
+            - name: SCALAS3_ADMIN_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret }}, key: adminToken } }
+            - name: SCALAS3_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret }}, key: masterKey, optional: true } }
+            - { name: JAVA_TOOL_OPTIONS, value: {{ .Values.javaToolOptions | quote }} }
+            {{- if .Values.tls.caSecret }}
+            - { name: SCALAS3_TLS_CA_DIR, value: /etc/scalas3/ca }
+            {{- end }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet: { path: /v1/health, port: admin }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/scalas3/data }
+            {{- if .Values.tls.caSecret }}
+            - { name: ca, mountPath: /etc/scalas3/ca, readOnly: true }
+            {{- end }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.tls.caSecret }}
+      volumes:
+        - name: ca
+          secret: { secretName: {{ .Values.tls.caSecret }}, defaultMode: 0440 }
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

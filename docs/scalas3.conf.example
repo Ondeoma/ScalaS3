@@ -1,0 +1,62 @@
+# scalas3 の設定ファイル（HOCON）。`scalas3-server --config /etc/scalas3/scalas3.conf` か SCALAS3_CONFIG で渡す。
+# 同じ項目の環境変数があれば、環境変数が優先する（例：SCALAS3_ADMIN_TOKEN）。
+# 項目と環境変数の対応は server/src/main/scala/scalas3/server/ConfigFile.scala を参照。知らない項目は起動時にエラーになる。
+scalas3 {
+  node-id = "n1"
+  data = "/var/lib/scalas3/data"
+  # ブロックを置くディスク（省略すると data/disk0）
+  disks = ["/mnt/disk1", "/mnt/disk2"]
+  zone = "rack1"
+
+  # クラスタを作る初期メンバーなら true。後から加わるノードは false
+  bootstrap = true
+  # ほかのノードの RPC のアドレス
+  peers {
+    n2 = "10.0.0.2:3901"
+    n3 = "10.0.0.3:3901"
+  }
+  copies = 3
+  replicas = 3
+
+  rpc {
+    listen = "0.0.0.0:3901"
+    advertise = "10.0.0.1:3901"
+  }
+
+  s3 {
+    listen = "0.0.0.0:3900"
+    region = "us-east-1"
+    storage-classes {
+      STANDARD = "replica"
+      STANDARD_IA = "ec:4:2"
+    }
+    # 公開ポートを HTTPS にする（docs/tls.md）
+    # tls {
+    #   cert = "/etc/letsencrypt/live/s3.example.com/fullchain.pem"
+    #   key = "/etc/letsencrypt/live/s3.example.com/privkey.pem"
+    # }
+    # 前段のリバースプロキシや CDN（docs/reverse-proxy.md）
+    trusted-proxies {
+      addresses = ["10.0.0.5"]
+      # hops = 2
+      # client-ip-header = "x-forwarded-for"
+    }
+  }
+
+  admin {
+    listen = "127.0.0.1:3903"
+    # 秘密は環境変数で渡すのがよい（SCALAS3_ADMIN_TOKEN、SCALAS3_SECRET_KEY）
+    # token = "..."
+    access-key = "AKIDADMIN000000000001"
+    # secret-key = "..."
+  }
+
+  # ノード間 TLS（docs/tls.md）
+  tls {
+    ca-dir = "/etc/scalas3/ca"
+    # join-token = "S3J1...."
+    # join-address = "10.0.0.1:3902"
+    # 自動発行する証明書の有効日数（既定 1095 = 3 年。2/3 を過ぎると自動で更新する）
+    # cert-days = 1095
+  }
+}

@@ -1,0 +1,38 @@
+image:
+  repository: scalas3
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# ノード数（StatefulSet のレプリカ数）。初期メンバーとして全員が同じ SCALAS3_PEERS を持つ
+replicas: 3
+
+# ブロックを何ノードに置くか / メタデータを何ノードで複製するか
+copies: 3
+metadataReplicas: 3
+
+# ストレージクラス（例: "STANDARD=replica,EC42=ec:4:2"）
+storageClasses: "STANDARD=replica"
+
+# 既存の Secret を使う（キー: accessKey, secretKey, adminToken, masterKey（任意））
+existingSecret: scalas3-secrets
+
+# ノード間 TLS（docs/tls.md）。内部 CA の Secret（キー: ca.crt, ca.key, join.secret。`scalas3 cert init-ca` で作ったもの）を
+# 指定すると、各ノードが起動時に自分の証明書を発行し、期限の 2/3 で自動で更新する。空なら平文。
+tls:
+  caSecret: ""
+
+# JVM のオプション。ヒープはコンテナのメモリの半分（ヒープの外で約 300 MB 使う。docs/benchmark.md）
+javaToolOptions: "-XX:+UseG1GC -XX:MaxRAMPercentage=50"
+
+# 追加の環境変数（例: [{ name: SCALAS3_GC_INTERVAL, value: "30m" }]）
+env: []
+
+# データのボリュームの所有グループ（イメージの scalas3 ユーザーで書けるようにする）
+podSecurityContext:
+  fsGroup: 999
+
+persistence:
+  size: 100Gi
+  storageClassName: ""
+
+resources: {}

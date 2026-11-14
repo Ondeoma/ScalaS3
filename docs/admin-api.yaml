@@ -1,0 +1,165 @@
+openapi: 3.0.3
+info:
+  title: scalas3 Admin API
+  version: 0.1.0
+  description: |
+    scalas3 の管理用 API。`SCALAS3_ADMIN_LISTEN` と `SCALAS3_ADMIN_TOKEN` を設定したノードで動く。
+    `/metrics` と `/v1/health` 以外は `Authorization: Bearer <token>` が必要。
+servers:
+  - url: http://127.0.0.1:3903
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+  schemas:
+    Error:
+      type: object
+      properties: { error: { type: string } }
+    NodeInfo:
+      type: object
+      properties:
+        address: { type: string, example: "10.0.0.1:3901" }
+        zone: { type: string }
+        weight: { type: integer }
+        state: { type: string, enum: [Active, Draining] }
+    Layout:
+      type: object
+      properties:
+        version: { type: integer }
+        nodes:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/NodeInfo" }
+    Grant:
+      type: object
+      properties:
+        read: { type: boolean }
+        write: { type: boolean }
+        owner: { type: boolean }
+    AccessKey:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        admin: { type: boolean }
+        grants:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/Grant" }
+        secret: { type: string, description: "作成したときだけ返す" }
+    Remote:
+      type: object
+      required: [endpoint, accessKey, secretKey]
+      properties:
+        endpoint: { type: string, example: "https://s3.other-site.example.com" }
+        region: { type: string, default: us-east-1 }
+        accessKey: { type: string }
+        secretKey: { type: string, writeOnly: true }
+paths:
+  /metrics:
+    get:
+      summary: Prometheus 形式のメトリクス
+      security: []
+      responses: { "200": { description: テキスト, content: { text/plain: {} } } }
+  /v1/health:
+    get:
+      summary: 生存確認
+      security: []
+      responses: { "200": { description: OK } }
+  /v1/status:
+    get:
+      summary: ノードのレイアウト、このノードから見たほかのノードの死活、このノードにあるレンジの Raft の状態
+      description: |
+        health は、このノードから見たほかのノードの死活（up: 応答があるか、lastSeenSecondsAgo: 最後に応答があってからの秒数、
+        features: 相手の版が対応している機能の水準。-1 はまだ分からない、0 は水準を返さない古い版。docs/upgrade.md）。
+        30 秒応答がないと up が false になる。Down は表示と警告だけで、データは動かさない（取り外すときは Draining にする）。
+      responses: { "200": { description: OK }, "401": { description: 認証エラー } }
+  /v1/layout:
+    get:
+      summary: レイアウト
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Layout" } } } }
+  /v1/layout/nodes/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    put:
+      summary: ノードの設定を変える（無ければ加える。そのときは address が必要）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                address: { type: string }
+                zone: { type: string }
+                weight: { type: integer }
+                state: { type: string, enum: [Active, Draining] }
+      responses:
+        "200": { description: 新しいレイアウト }
+        "400": { description: 不正な値, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      summary: ノードをレイアウトから外す（Draining にしてデータを移してから）
+      responses: { "200": { description: 新しいレイアウト }, "400": { description: Draining になっていない } }
+  /v1/keys:
+    get:
+      summary: アクセスキーの一覧（秘密鍵は含まない）
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/AccessKey" } } } } }
+    post:
+      summary: アクセスキーを作る
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                admin: { type: boolean }
+                id: { type: string, description: 省略するとランダム }
+      responses:
+        "201": { description: 作ったキー（秘密鍵を含む）, content: { application/json: { schema: { $ref: "#/components/schemas/AccessKey" } } } }
+  /v1/keys/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    delete:
+      summary: アクセスキーを消す
+      responses: { "204": { description: OK } }
+  /v1/keys/{id}/grants:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    put:
+      summary: バケットの権限を与える（どれも false なら外す）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - type: object
+                  properties: { bucket: { type: string } }
+                - $ref: "#/components/schemas/Grant"
+      responses: { "200": { description: OK }, "404": { description: キーが無い } }
+  /v1/buckets:
+    get:
+      summary: バケットの一覧
+      responses: { "200": { description: OK } }
+  /v1/remotes:
+    get:
+      summary: クラスタ間複製の転送先の一覧
+      responses: { "200": { description: OK } }
+  /v1/remotes/{name}:
+    parameters: [{ name: name, in: path, required: true, schema: { type: string } }]
+    put:
+      summary: 転送先を登録する（バケットのレプリケーション設定の Destination/Remote で名前を指定する）
+      requestBody:
+        content: { application/json: { schema: { $ref: "#/components/schemas/Remote" } } }
+      responses: { "204": { description: OK }, "400": { description: 必須項目が無い } }
+    delete:
+      summary: 転送先を消す
+      responses: { "204": { description: OK } }
+  /v1/jobs/{job}:
+    parameters:
+      - name: job
+        in: path
+        required: true
+        schema: { type: string, enum: [repair, gc, scrub, lifecycle, replication] }
+    post:
+      summary: 管理ジョブをすぐに実行し、結果を返す
+      responses: { "200": { description: OK }, "404": { description: 知らないジョブ } }

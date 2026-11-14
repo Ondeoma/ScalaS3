@@ -1,0 +1,12 @@
+target/
+.bsp/
+.bloop/
+.metals/
+.idea/
+.vscode/
+*.class
+*.log
+.DS_Store
+data/
+*/data/
+.claude/worktrees/
