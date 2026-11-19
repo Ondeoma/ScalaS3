@@ -45,6 +45,10 @@ final class SharedRaftLog private (
   private var buf = ByteWriter()
   private var appendedSeq = 0L
   private var pendingDelete = Vector.empty[(Long, Long)] // (消せるようになる seq, セグメント)
+  // 書き込み中のセグメントを切り替える大きさ。切り替えのときの書き直しの分だけ segmentBytes より大きくする。
+  // 書き直しを数えると、全グループのエントリの合計が segmentBytes * maxSegments を超えたとき、書き直しだけで
+  // セグメントが埋まって切り替わり、また書き直す、を新しい書き込みが無くても繰り返す（ディスクと GC を使い切る）
+  private var segLimit = config.segmentBytes
 
   private def currentSeg: Long = segments.last
 
@@ -103,8 +107,8 @@ final class SharedRaftLog private (
     }
 
   private def rotateIfNeeded: IO[Unit] =
-    segHandle.get.flatMap { (_, rel, pos) =>
-      if pos < config.segmentBytes then IO.unit
+    (segHandle.get, lock.lock.surround(IO(segLimit))).tupled.flatMap { case ((_, rel, pos), limit) =>
+      if pos < limit then IO.unit
       else
         val next = currentSeg + 1
         for
@@ -116,6 +120,7 @@ final class SharedRaftLog private (
             segments :+= next
             // 上限を超えた古いセグメントに記録が残っているグループを Reset で書き直す
             val toFree = segments.dropRight(config.maxSegments).filterNot(s => pendingDelete.exists(_._2 == s))
+            val before = buf.size
             if toFree.nonEmpty then
               val upTo = toFree.last
               groups.toList.sortBy(_._1).foreach { (g, st) =>
@@ -124,6 +129,8 @@ final class SharedRaftLog private (
                   st.firstSeg = next
               }
               pendingDelete ++= toFree.map(s => (appendedSeq, s))
+            // 書き直しは新しいセグメントに入るので、その分は切り替えの判定に数えない
+            segLimit = config.segmentBytes + (buf.size - before)
           })
           _ <- wake.offer(()) // 書き直した分を次の周で書く
         yield ()

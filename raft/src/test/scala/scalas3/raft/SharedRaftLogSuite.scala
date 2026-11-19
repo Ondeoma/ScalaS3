@@ -106,6 +106,33 @@ class SharedRaftLogSuite extends CatsEffectSuite:
     }
   }
 
+  test("全グループのエントリの合計がセグメントの上限より大きくても、書き直しだけでセグメントを切り替え続けない") {
+    // 20 グループ × 約 2.4KB = 約 48KB。segmentBytes * maxSegments = 12KB より大きい
+    // （以前は、切り替えのたびの書き直しでセグメントが埋まり、新しい書き込みが無くても切り替えと書き直しを繰り返した）
+    val cfg = SharedRaftLog.Config(segmentBytes = 4096, maxSegments = 3)
+    val groups = (1L to 20L).toList
+    def maxSeg(fs: SimFileSystem) = fs.list(dir / "log").map(_.map(_.fileName.toString.stripSuffix(".seg").toLong).max)
+    for
+      fs <- SimFileSystem.create(5L, tornWrites = false)
+      r <- SharedRaftLog.open(fs, dir, cfg).use { log =>
+        for
+          _ <- groups.traverse_(g => log.storage(g).flatMap(st => st.append(Some(HardState(1, None)), None, (1L to 30L).map(e(_, 1, 64)).toVector) >> st.sync))
+          // 書き込みが止まったあと、回収が落ち着くまで待つ
+          _ <- IO.sleep(scala.concurrent.duration.DurationInt(300).millis)
+          a <- maxSeg(fs)
+          _ <- IO.sleep(scala.concurrent.duration.DurationInt(300).millis)
+          b <- maxSeg(fs)
+        yield (a, b)
+      }
+      _ <- fs.powerFail
+      loaded <- SharedRaftLog.open(fs, dir, cfg).use(log => groups.traverse(g => log.storage(g).flatMap(_.load)))
+    yield
+      val (a, b) = r
+      assertEquals(b, a, "書き込みが無いのにセグメントが切り替わり続けている")
+      assert(a < 40L, s"切り替えが多すぎる: $a")
+      loaded.foreach(l => assertEquals(l.entries.map(_.index), (1L to 30L).toVector))
+  }
+
   test("drop したグループは再起動後に残らない") {
     for
       fs <- SimFileSystem.create(4L, tornWrites = false)
