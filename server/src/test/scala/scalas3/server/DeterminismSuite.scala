@@ -35,6 +35,7 @@ class DeterminismSuite extends CatsEffectSuite:
       raft = RaftNodeConfig(raft = RaftConfig(electionTicks = 10), tickInterval = 50.millis, snapshotThreshold = 200),
       splitBytes = 4000,
       maintenanceInterval = 300.millis,
+      mergeCheckInterval = Duration.Zero,
       requestTimeout = 5.seconds,
       splitBoundary = S3Keys.splitBoundary
     ),

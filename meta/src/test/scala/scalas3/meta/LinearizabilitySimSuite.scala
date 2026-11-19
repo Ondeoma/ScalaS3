@@ -28,6 +28,7 @@ class LinearizabilitySimSuite extends CatsEffectSuite:
     raft = RaftNodeConfig(raft = RaftConfig(electionTicks = 10), tickInterval = 50.millis, snapshotThreshold = 30),
     splitBytes = 1500,
     maintenanceInterval = 300.millis,
+    mergeCheckInterval = Duration.Zero,
     requestTimeout = 2.seconds
   )
   private val baseKeys = Vector("x", "y", "z", "w").map(k => Keys.DataStart ++ ByteVector(k.getBytes))

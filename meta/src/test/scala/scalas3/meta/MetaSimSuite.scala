@@ -23,6 +23,7 @@ class MetaSimSuite extends CatsEffectSuite:
     raft = RaftNodeConfig(raft = RaftConfig(electionTicks = 10), tickInterval = 50.millis, snapshotThreshold = 50),
     splitBytes = 3000,
     maintenanceInterval = 300.millis,
+    mergeCheckInterval = Duration.Zero,
     requestTimeout = 3.seconds
   )
   private val lsmConfig = LsmConfig(memtableBytes = 16 * 1024, blockBytes = 512, targetFileBytes = 8 * 1024)

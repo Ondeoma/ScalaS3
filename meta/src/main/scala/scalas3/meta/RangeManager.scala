@@ -24,6 +24,11 @@ final case class MetaConfig(
     /** 統合してよいか。ローリングアップグレードの途中（統合のコマンドを読めない古い版のノードがいる間）は false にする。 */
     mergeAllowed: IO[Boolean] = IO.pure(true),
     maintenanceInterval: FiniteDuration = 1.second,
+    /** 統合できるかを調べる間隔（0 なら管理作業のたび）。調べるたびに、リーダーのレンジとその右隣の中身を mergeBytes まで
+      * LSM から読むので、レンジが多いと毎秒の管理作業では重い（75 レンジで、ページキャッシュから毎秒約 200 MB を読み、
+      * CPU を 1 コアの半分ほど使った）。統合は急がないので、間隔をあける。
+      */
+    mergeCheckInterval: FiniteDuration = 1.minute,
     requestTimeout: FiniteDuration = 10.seconds,
     /** 分割点を「オブジェクトの境目」に揃える関数。None なら、その付近では分割しない。 */
     splitBoundary: ByteVector => Option[ByteVector] = Some(_),
@@ -55,7 +60,9 @@ final class RangeManager private (
     adopting: Ref[IO, Set[Long]],
     snapshotLimits: SnapshotLimits,
     /** 統合で取り込まれ、このノードで片付けたレンジ。再び立ち上げない。 */
-    retired: Ref[IO, Set[Long]]
+    retired: Ref[IO, Set[Long]],
+    /** 最後に統合を調べた時刻（IO.monotonic）。 */
+    lastMergeCheck: Ref[IO, Option[FiniteDuration]]
 ):
 
   /** 管理作業や未知のグループの処理で使うクライアントを渡す（作成の順序の都合で後から）。 */
@@ -175,7 +182,8 @@ final class RangeManager private (
       // 統合の相手探しと、取り込まれたレンジの古い記述子の片付けに使う（重なりを解かない一覧）
       leads <- rs.existsM(_.node.status.map(_.role == Role.Leader))
       // 統合のコマンドを読めない古い版のノードがいる間（ローリングアップグレードの途中）は、統合しない
-      mergeOk <- if config.mergeBytes > 0 && leads then config.mergeAllowed else IO.pure(false)
+      mergeDue <- mergeCheckDue
+      mergeOk <- if config.mergeBytes > 0 && leads && mergeDue then config.mergeAllowed else IO.pure(false)
       system <- if mergeOk then client.systemDescriptors.attempt.map(_.toOption) else IO.pure(None)
       _ <- rs.traverse_ { r =>
         (r.node.status, r.sm.frozen).flatMapN { (st, frozen) =>
@@ -190,6 +198,15 @@ final class RangeManager private (
       _ <- adoptMissing(client).attempt.void
       _ <- balanceLeaders(client).attempt.void
     yield ()
+
+  /** 前回から mergeCheckInterval 経っていれば、今回を統合を調べる回にする。 */
+  private def mergeCheckDue: IO[Boolean] =
+    IO.monotonic.flatMap { now =>
+      lastMergeCheck.modify {
+        case Some(last) if now - last < config.mergeCheckInterval => (Some(last), false)
+        case _                                                    => (Some(now), true)
+      }
+    }
 
   /** リーダーが 1 台に偏らないよう、受け持ちの多いノードから少ないノードへ譲る（Raft のリーダー移譲）。
     *
@@ -473,11 +490,12 @@ object RangeManager:
       clientRef <- Resource.eval(Ref.of[IO, Option[MetaClient]](None))
       adopting <- Resource.eval(Ref.of[IO, Set[Long]](Set.empty))
       retired <- Resource.eval(Ref.of[IO, Set[Long]](Set.empty))
+      lastMergeCheck <- Resource.eval(Ref.of[IO, Option[FiniteDuration]](None))
       // 共有ログはレプリカより長く生かす（Resource は逆順に解放される）
       raftLog <- SharedRaftLog.open(fs, dir / "raftlog")
       // スナップショットはノード全体で、送信 2 本・取り込み 1 本まで（RaftNode の SnapshotLimits を参照）
       limits <- Resource.eval(SnapshotLimits(sends = 2, installs = 1))
-      rm <- Resource.make(IO.pure(new RangeManager(nodeId, fs, dir, lsm, raftLog, transport, config, replicas, lock, sup, seed, clientRef, adopting, limits, retired)))(_.stopAll)
+      rm <- Resource.make(IO.pure(new RangeManager(nodeId, fs, dir, lsm, raftLog, transport, config, replicas, lock, sup, seed, clientRef, adopting, limits, retired, lastMergeCheck)))(_.stopAll)
     yield rm
 
   /** クラスタを作る。全初期メンバーが同じ内容を書くので、レンジ 0 と 1 の「インデックス 0 時点の状態」が一致する。 */
