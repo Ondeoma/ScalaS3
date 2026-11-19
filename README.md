@@ -47,6 +47,23 @@ SCALAS3_ACCESS_KEY=... SCALAS3_SECRET_KEY=... sbt "server/run"
 | `SCALAS3_S3_TLS_CERT` / `SCALAS3_S3_TLS_KEY` | 公開ポートを HTTPS にする（PEM。Let's Encrypt の `fullchain.pem` と `privkey.pem` をそのまま使え、更新されると読み直す。[docs/tls.md](docs/tls.md)） |
 | `SCALAS3_TRUSTED_PROXIES` | 前段のリバースプロキシや CDN のアドレス。送信元 IP をヘッダーから読む（[docs/reverse-proxy.md](docs/reverse-proxy.md)） |
 
+### 必要なメモリ
+
+本番で動かすノードは、**メモリ 4 GB(ヒープ 2 GB)を基準**にしてください。2 GB(ヒープ 1 GB)では、レンジが増えると
+GC が CPU を使い切ります(社内の 1 台構成で、75 レンジ・約 8 万オブジェクトのときにヒープ 1 GB で起きた)。
+
+ヒープに載る主なもの:
+
+| もの | 大きさ |
+|---|---|
+| Raft のログ(レンジごと) | スナップショットまでに適用したコマンドを最大 8 MiB(`RaftNodeConfig.snapshotBytes`)。遅れたフォロワーがいるリーダーは最大 32 MiB(`maxRetainedBytes`)。共有ログ(`SharedRaftLog`)も同じエントリを持つ |
+| memtable | ヒープの 1/24 × (書き込み中 1 枚 + flush 待ち 4 枚)= ヒープの約 2 割 |
+| そのほか | バケット・アクセスキーのキャッシュ、要求の処理中のバッファなど |
+
+目安は **ヒープ ≒ レンジ数 × 8 MiB × 2(G1 の余裕)+ 512 MiB**。75 レンジで約 1.7 GiB です。レンジはメタデータが増えると分割されて増えるので
+(`scalas3_ranges` で見られる)、オブジェクトが増えたら見直してください。ヒープの外にも約 300 MB 要ります([docs/benchmark.md](docs/benchmark.md) の「メモリ」)。
+`-XX:MaxRAMPercentage=50` なら、メモリの半分がヒープになります。開発や試験で小さく動かすだけなら、ヒープ 512 MB でも動きます。
+
 ## 管理 CLI
 
 JVM の fat jar（`java -jar cli/target/scala-3.9.0/scalas3-cli.jar`）のほか、GraalVM があればネイティブのバイナリにもできます（`GRAALVM_HOME=… scripts/build-cli-native.sh`）。
