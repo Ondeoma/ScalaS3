@@ -24,9 +24,9 @@ final case class MetaConfig(
     /** 統合してよいか。ローリングアップグレードの途中（統合のコマンドを読めない古い版のノードがいる間）は false にする。 */
     mergeAllowed: IO[Boolean] = IO.pure(true),
     maintenanceInterval: FiniteDuration = 1.second,
-    /** 統合できるかを調べる間隔（0 なら管理作業のたび）。調べるたびに、リーダーのレンジとその右隣の中身を mergeBytes まで
-      * LSM から読むので、レンジが多いと毎秒の管理作業では重い（75 レンジで、ページキャッシュから毎秒約 200 MB を読み、
-      * CPU を 1 コアの半分ほど使った）。統合は急がないので、間隔をあける。
+    /** 統合できるかを調べる間隔（0 なら管理作業のたび）。中身の大きさは LSM のインデックスから見積もるので軽いが、
+      * 統合は急がないので間隔をあける（以前は中身を mergeBytes まで LSM から読んでいて、75 レンジで毎秒約 200 MB を
+      * 読んだ。墓石は数えずに読み飛ばしていたので、大量に消したレンジでは、ゴミを全部読んでいた）。
       */
     mergeCheckInterval: FiniteDuration = 1.minute,
     requestTimeout: FiniteDuration = 10.seconds,
@@ -375,7 +375,7 @@ final class RangeManager private (
                 else if frozen then absorb(client, r, d, rdesc)
                 else
                   val quiet = !st.membership.isJoint && st.membership.learners.isEmpty && d.replicas == st.membership.voters && rdesc.replicas == d.replicas
-                  (if quiet then (localBytes(d), localBytes(rdesc)).mapN(_ + _) else IO.pure(Long.MaxValue)).flatMap { total =>
+                  (if quiet then (mergeCheckBytes(d), mergeCheckBytes(rdesc)).mapN(_ + _) else IO.pure(Long.MaxValue)).flatMap { total =>
                     if total > mergeLimit then IO.unit
                     else
                       client.proposeTo(rdesc, Command.Freeze(rdesc.generation)).flatMap {
@@ -420,7 +420,17 @@ final class RangeManager private (
   /** 統合する上限。分割と統合を繰り返さないよう、分割の大きさの 1/4 を超えないようにする。 */
   private def mergeLimit: Long = math.min(config.mergeBytes, config.splitBytes / 4)
 
-  /** 区間の中身のおおよその量（このノードの LSM から。mergeLimit を超えたら数えるのをやめる）。 */
+  /** 統合できるかを決めるための、区間の中身の大きさ（mergeLimit を超えたら、それより大きい値）。
+    * まず LSM のインデックスから見積もり（ディスクは読まない。墓石や古い値も含むので実際以上）、それが mergeLimit 以下なら
+    * それで決める。超えるときだけ中身を読んで数えるが、墓石も含めて mergeLimit を読んだら打ち切る
+    * （大量に消した範囲で、ゴミを全部読まないため。そうした範囲は、LSM のコンパクションでゴミが消えてから統合される）。
+    */
+  private def mergeCheckBytes(d: RangeDescriptor): IO[Long] =
+    lsm.approximateBytes(d.start, d.end).flatMap { est =>
+      if est <= mergeLimit then IO.pure(est) else lsm.liveBytes(d.start, d.end, mergeLimit)
+    }
+
+  /** 区間の中身のおおよその量（このノードの LSM から。mergeLimit を超えたら数えるのをやめる）。統合するときだけ使う。 */
   private def localBytes(d: RangeDescriptor): IO[Long] =
     lsm.scan(d.start, d.end)
       .scan(0L)((n, kv) => n + kv._1.size + kv._2.size)

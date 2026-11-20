@@ -8,8 +8,10 @@ import scodec.bits.ByteVector
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-/** SST ファイルの情報（マニフェストに記録する）。 */
-final case class SstMeta(id: Long, level: Int, smallest: ByteVector, largest: ByteVector, size: Long, entries: Long):
+/** SST ファイルの情報（マニフェストに記録する）。deletes は墓石の件数（古い形式のマニフェストから読んだときは
+  * 分からないので -1。バックグラウンドで数え直す）。
+  */
+final case class SstMeta(id: Long, level: Int, smallest: ByteVector, largest: ByteVector, size: Long, entries: Long, deletes: Long = -1L):
   def overlaps(lo: ByteVector, hi: ByteVector): Boolean =
     Bytes.compare(largest, lo) >= 0 && Bytes.compare(smallest, hi) <= 0
 
@@ -81,6 +83,10 @@ object Sst:
     private var lastKey: ByteVector = null
     private var first: ByteVector = null
     private var count = 0L
+    private var dels = 0L
+
+    /** これまでに加えた墓石の件数。 */
+    def deletes: Long = dels
 
     def isEmpty: Boolean = count == 0
     def estimatedSize: Long = out.size.toLong + block.size
@@ -92,7 +98,7 @@ object Sst:
       block.lenBytes(key)
       e match
         case Entry.Put(v) => block.u8(KindPut).lenBytes(v)
-        case Entry.Del    => block.u8(KindDel)
+        case Entry.Del    => block.u8(KindDel); dels += 1
       bloomHashes += Bloom.hash(key.toArrayUnsafe)
       lastKey = key
       count += 1
@@ -158,6 +164,22 @@ object Sst:
         if b.size != e.size then IO.raiseError(CorruptionException(s"sst ${meta.id}: short read"))
         else IO(decodeBlock(b))
       }
+
+    /** [from, until) にかかるブロックの大きさの合計（メモリのインデックスだけから求める。ディスクは読まない）。
+      * 範囲の端のブロックは丸ごと数えるので、実際より少し大きめになる。
+      */
+    def approximateBytes(from: ByteVector, until: Option[ByteVector]): Long =
+      if Bytes.compare(meta.largest, from) < 0 || until.exists(u => Bytes.compare(meta.smallest, u) >= 0) then 0L
+      else
+        val start = blockFor(from)
+        // until を含みうるブロックまで（そのブロックは until より前のキーを含みうる）
+        val end = until.fold(index.length)(u => math.min(index.length, blockFor(u) + 1))
+        var n = 0L
+        var i = start
+        while i < end do
+          n += index(i).size
+          i += 1
+        n
 
     /** key を含みうる最初のブロック（なければ blockCount）。 */
     def blockFor(key: ByteVector): Int = lowerBound(index.length, key)(index(_).lastKey)

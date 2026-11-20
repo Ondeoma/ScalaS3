@@ -23,8 +23,11 @@ object Version:
   * {{{
   * [magic u32][format u8][nextFileId u64][levels u8][count varint]
   *   ([level u8][id u64][smallest lenBytes][largest lenBytes][size u64][entries u64])*
+  *   ([deletes u64])*   ← ファイルと同じ順・同じ件数。ない（前の版が書いた）ときは -1 = 不明
   * [crc32c u32]
   * }}}
+  * deletes は後から足した部分。形式の番号は上げず、末尾に置く（前の版はファイルの一覧の後を読まないので、
+  * この版が書いたマニフェストを前の版に戻しても読める。形式を上げると、前の版は読めずに SST を全部消してしまう）。
   */
 final case class Manifest(nextFileId: Long, version: Version)
 
@@ -37,6 +40,7 @@ object Manifest:
     val files = m.version.files.toVector
     w.u32(Magic).u8(Format).u64(m.nextFileId).u8(m.version.levels.size).varInt(files.size)
     files.foreach(f => w.u8(f.level).u64(f.id).lenBytes(f.smallest).lenBytes(f.largest).u64(f.size).u64(f.entries))
+    files.foreach(f => w.u64(f.deletes))
     val body = w.toArray
     ByteVector.view(body) ++ ByteVector.fromInt(Crc32c(body))
 
@@ -59,8 +63,9 @@ object Manifest:
               entries = r.u64()
             )
           )
+          val withDeletes = if r.hasRemaining then files.map(f => f.copy(deletes = r.u64())) else files
           val levels = Vector.tabulate(nlevels) { lv =>
-            val fs = files.filter(_.level == lv)
+            val fs = withDeletes.filter(_.level == lv)
             if lv == 0 then fs.sortBy(-_.id) else fs.sorted(using SstMeta.bySmallest)
           }
           Right(Manifest(next, Version(levels)))

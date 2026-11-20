@@ -19,7 +19,13 @@ final case class LsmConfig(
     baseLevelBytes: Long = 128L * 1024 * 1024,
     levelMultiplier: Int = 10,
     maxLevels: Int = 7,
-    bloomBitsPerKey: Int = 10
+    bloomBitsPerKey: Int = 10,
+    /** 墓石がこの割合以上で、tombstoneMinDeletes 件以上あるファイルは、レベルの大きさに関係なく下へ押し出す
+      * （墓石と、それが隠している古い値は、一番下まで下りたときにしか捨てられない。大量に消したあと書き込みが少ないと、
+      * レベルが大きさの上限に届かず、ゴミがいつまでも残って、範囲を読むたびにそれを読むことになる）。
+      */
+    tombstoneRatio: Double = 0.5,
+    tombstoneMinDeletes: Long = 1024
 )
 
 object LsmConfig:
@@ -63,6 +69,24 @@ final class LsmSnapshot private[lsm] (
           }
         }
       }
+    }
+
+  /** [from, until) の生きているエントリの大きさ（キー＋値）を、limit を超えるまで数える。墓石を含めて読んだ量
+    * （墓石はキーの大きさ）も limit までで打ち切り、そのときは limit + 1 を返す（大きいとみなす）。
+    * 墓石ばかりの範囲を、ゴミを全部読んでまで数えないため。
+    */
+  def liveBytes(from: ByteVector, until: Option[ByteVector], limit: Long): IO[Long] =
+    merged(from).flatMap { c =>
+      def loop(live: Long, read: Long): IO[Long] =
+        if live > limit then IO.pure(live)
+        else if read > limit then IO.pure(limit + 1)
+        else if !c.valid || until.exists(u => Bytes.compare(c.key, u) >= 0) then IO.pure(live)
+        else
+          val k = c.key.size
+          c.entry match
+            case Entry.Put(v) => c.next >> loop(live + k + v.size, read + k + v.size)
+            case Entry.Del    => c.next >> loop(live, read + k)
+      loop(0L, 0L)
     }
 
   /** 全エントリ（墓石を含む）をマージしたカーソル。 */
@@ -129,6 +153,23 @@ final class Lsm private (
   def scan(from: ByteVector, until: Option[ByteVector]): Stream[IO, (ByteVector, ByteVector)] =
     Stream.resource(snapshot).flatMap(_.scan(from, until))
 
+  /** LsmSnapshot.liveBytes を、その時点のスナップショットで行う。 */
+  def liveBytes(from: ByteVector, until: Option[ByteVector], limit: Long): IO[Long] =
+    snapshot.use(_.liveBytes(from, until, limit))
+
+  /** [from, until) のおおよその大きさ（バイト）。memtable のエントリと、SST のその範囲にかかるブロックの大きさの合計。
+    * SST はメモリにあるインデックスだけを見るのでディスクを読まない。墓石や、隠された古い値も数えるので、
+    * 消したばかりの範囲は、コンパクションでゴミが捨てられるまで大きめに出る。
+    */
+  def approximateBytes(from: ByteVector, until: Option[ByteVector]): IO[Long] =
+    state.get.map { s =>
+      val mem = (s.mem :: s.imms).iterator.map { m =>
+        val r = until.fold(m.map.rangeFrom(from))(u => m.map.range(from, u))
+        r.iterator.map((k, e) => k.size + (e match { case Entry.Put(v) => v.size; case Entry.Del => 0L })).sum
+      }.sum
+      mem + s.version.files.map(f => s.readers(f.id).approximateBytes(from, until)).sum
+    }
+
   /** ここまでの書き込みをすべて永続化する。 */
   def flush: IO[Unit] =
     writeLock.lock.surround {
@@ -185,7 +226,7 @@ final class Lsm private (
         id <- nextId
         (bytes, smallest, largest, count) = b.finish()
         _ <- fs.open(fileName(id), OpenMode.CreateNew).use(h => h.write(0, bytes) >> h.sync)
-      yield SstMeta(id, level, smallest, largest, bytes.size, count)
+      yield SstMeta(id, level, smallest, largest, bytes.size, count, b.deletes)
 
     def loop(b: Sst.Builder, acc: Vector[SstMeta]): IO[Vector[SstMeta]] =
       if !entries.valid then if b.isEmpty then IO.pure(acc) else writeOne(b).map(acc :+ _)
@@ -234,6 +275,32 @@ final class Lsm private (
             metas
           )
           _ <- progress.update(_.copy(flushedSeq = mem.seq))
+        yield true
+    }
+
+  /** 墓石の件数が分からない（前の版が書いたマニフェストにない）ファイルを 1 つ読んで数える。数えたら true。
+    * 最後の 1 つを数えたら、マニフェストに書く（次に開いたときに数え直さずに済む）。
+    * 版を書き換えるのはこのワーカーだけ（フラッシュ・コンパクションと同じ）なので、途中で版が変わることはない。
+    */
+  private def countDeletesOnce: IO[Boolean] =
+    state.get.map(s => s.version.files.find(_.deletes < 0).map(f => s.readers(f.id))).flatMap {
+      case None => IO.pure(false)
+      case Some(r) =>
+        for
+          c <- Cursor.SstFile.open(r, ByteVector.empty)
+          n <- {
+            def loop2(n: Long): IO[Long] =
+              if !c.valid then IO.pure(n)
+              else
+                val d = if c.entry == Entry.Del then 1L else 0L
+                c.next >> loop2(n + d)
+            loop2(0L)
+          }
+          _ <- state.update(s =>
+            s.copy(version = Version(s.version.levels.map(_.map(f => if f.id == r.meta.id then f.copy(deletes = n) else f))))
+          )
+          done <- state.get.map(_.version.files.forall(_.deletes >= 0))
+          _ <- install(s => (s.version, identity), Vector.empty).whenA(done)
         yield true
     }
 
@@ -287,13 +354,22 @@ final class Lsm private (
           val f = v.levels(lv).maxBy(_.size)
           Compaction(lv, Vector(f), overlapping(lv + 1, f.smallest, f.largest))
         }
+        .orElse {
+          // 大きさで押し出すものがなければ、墓石の多いファイルを 1 つ下へ（一番多いものから）。
+          // 押し出した先がまだ一番下でなければ、そこで再び選ばれて、一番下まで下りたところで墓石とゴミが消える
+          (1 until config.maxLevels - 1).iterator
+            .flatMap(lv => v.levels(lv).iterator.map(lv -> _))
+            .filter((_, f) => f.deletes >= config.tombstoneMinDeletes && f.deletes >= f.entries * config.tombstoneRatio)
+            .maxByOption(_._2.deletes)
+            .map((lv, f) => Compaction(lv, Vector(f), overlapping(lv + 1, f.smallest, f.largest)))
+        }
 
-  /** バックグラウンド処理：フラッシュを優先し、なければコンパクション。 */
+  /** バックグラウンド処理：フラッシュを優先し、なければコンパクション、それもなければ墓石の件数の数え直し。 */
   private[lsm] def worker: IO[Nothing] =
     def drain: IO[Unit] =
       flushOne.flatMap {
         case true  => drain
-        case false => compactOnce.flatMap(did => drain.whenA(did))
+        case false => (compactOnce, countDeletesOnce).mapN(_ || _).flatMap(did => drain.whenA(did))
       }
     (wake.take >> drain).foreverM.handleErrorWith { e =>
       progress.update(_.copy(error = Some(e))) >> IO.never

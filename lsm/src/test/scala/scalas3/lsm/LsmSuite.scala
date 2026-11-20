@@ -188,3 +188,102 @@ class LsmSuite extends CatsEffectSuite:
     }
   }
 
+
+  // ---- 墓石とゴミの回収・大きさの見積もり ----
+
+  /** 大きさによるコンパクションが L1 から先へ進まない設定（L1 の上限がとても大きい）。 */
+  private val wide = tiny.copy(baseLevelBytes = 1L << 40, tombstoneMinDeletes = 16)
+
+  /** cond が成り立つまで（最大 10 秒）バックグラウンドの処理を待つ。 */
+  private def eventually(what: String)(cond: IO[Boolean]): IO[Unit] =
+    def loop(n: Int): IO[Unit] =
+      cond.flatMap(ok => if ok then IO.unit else if n == 0 then IO(fail(s"$what が起きない")) else IO.sleep(scala.concurrent.duration.DurationInt(20).millis) >> loop(n - 1))
+    loop(500)
+
+  /** tiny の設定で 400 件を書き、L2 以降まで押し出しておく。 */
+  private def deepData(fs: SimFileSystem): IO[Unit] =
+    Lsm.open(fs, dir, tiny).use { lsm =>
+      (0 until 400).toList.traverse_(i => lsm.put(k(i), v("x" * 100))) >> lsm.flush >>
+        eventually("L2 以降へのコンパクション")(lsm.version.map(ver => ver.levels.drop(2).exists(_.nonEmpty) && ver.levels(0).isEmpty))
+    }
+
+  test("大量に消したあと書き込みが少なくても、墓石の多いファイルを下へ押し出し、墓石と古い値を捨てる") {
+    for
+      fs <- sim(torn = false)
+      _ <- deepData(fs)
+      r <- Lsm.open(fs, dir, wide).use { lsm =>
+        for
+          _ <- (0 until 400).toList.traverse_(i => lsm.delete(k(i))) >> lsm.flush
+          _ <- eventually("ゴミの回収")(lsm.version.map(ver => ver.files.forall(f => f.deletes == 0) && ver.files.map(_.entries).sum == 0L))
+          got <- all(lsm)
+          est <- lsm.approximateBytes(ByteVector.empty, None)
+        yield (got, est)
+      }
+      reopened <- Lsm.open(fs, dir, wide).use(lsm => all(lsm).product(lsm.version))
+    yield
+      val (got, est) = r
+      assertEquals(got, Nil)
+      assertEquals(est, 0L)
+      assertEquals(reopened._1, Nil)
+      assertEquals(reopened._2.files.size, 0)
+  }
+
+  test("前の版が書いた（墓石の件数のない）マニフェストでも開け、件数をバックグラウンドで数えて書き戻す") {
+    def manifestPath(fs: SimFileSystem) = fs.list(dir).map(_.filter(_.fileName.toString.startsWith("MANIFEST-")).head)
+    for
+      fs <- sim(torn = false)
+      _ <- deepData(fs)
+      // 一部を消して、墓石を含むファイルを作る（大きさの上限は大きく、墓石による押し出しもしない設定で）
+      noGc = wide.copy(tombstoneMinDeletes = Long.MaxValue, l0CompactionTrigger = 1000)
+      _ <- Lsm.open(fs, dir, noGc).use(lsm => (0 until 400 by 3).toList.traverse_(i => lsm.delete(k(i))) >> lsm.flush)
+      p <- manifestPath(fs)
+      bytes <- fs.readAll(p)
+      orig = Manifest.decode(bytes).toOption.get
+      _ = assert(orig.version.files.exists(_.deletes > 0), "墓石を含むファイルがない")
+      // 末尾の墓石の件数を外し、CRC を付け直して、前の版の形にする
+      body = bytes.dropRight(4).dropRight(8L * orig.version.files.size)
+      legacy = body ++ ByteVector.fromInt(scalas3.core.Crc32c(body.toArray))
+      _ <- fs.writeAtomically(p, legacy)
+      _ = assert(Manifest.decode(legacy).toOption.get.version.files.forall(_.deletes == -1L))
+      counted <- Lsm.open(fs, dir, noGc).use { lsm =>
+        eventually("墓石の件数の数え直し")(lsm.version.map(_.files.forall(_.deletes >= 0))) >>
+          (lsm.version, all(lsm)).tupled
+      }
+      written <- manifestPath(fs).flatMap(fs.readAll).map(b => Manifest.decode(b).toOption.get)
+    yield
+      val (ver, got) = counted
+      // 開いたあとのコンパクションでファイルが入れ替わることがあるので、残っているファイルで比べる
+      val want = orig.version.files.map(f => f.id -> f.deletes).toMap
+      val kept = ver.files.filter(f => want.contains(f.id)).toVector
+      assert(kept.exists(_.deletes > 0), s"墓石を含む元のファイルが残っていない: ${ver.files.map(_.id).toList}")
+      kept.foreach(f => assertEquals(f.deletes, want(f.id), s"file ${f.id}"))
+      assertEquals(written.version.files.map(f => f.id -> f.deletes).toMap, ver.files.map(f => f.id -> f.deletes).toMap)
+      assertEquals(got.map(_._1), (0 until 400).filterNot(_ % 3 == 0).map(k).toList)
+  }
+
+  test("範囲の大きさの見積もりはインデックスから求め、生きている量は墓石も含めて上限まで読んで打ち切る") {
+    for
+      fs <- sim(torn = false)
+      r <- Lsm.open(fs, dir, wide.copy(tombstoneMinDeletes = Long.MaxValue, memtableBytes = 1L << 20)).use { lsm =>
+        for
+          _ <- (0 until 200).toList.traverse_(i => lsm.put(k(i), v("y" * 50))) >> lsm.flush
+          whole <- lsm.approximateBytes(ByteVector.empty, None)
+          part <- lsm.approximateBytes(k(50), Some(k(100)))
+          none <- lsm.approximateBytes(k(500), None)
+          live <- lsm.liveBytes(k(50), Some(k(100)), 1L << 20)
+          over <- lsm.liveBytes(ByteVector.empty, None, 1000L)
+          // flush しない（墓石は memtable にあり、下の値を隠している）
+          _ <- (0 until 200).toList.traverse_(i => lsm.delete(k(i)))
+          dead <- lsm.liveBytes(ByteVector.empty, None, 500L)
+        yield (whole, part, none, live, over, dead)
+      }
+    yield
+      val (whole, part, none, live, over, dead) = r
+      val entry = k(0).size + 50L
+      assert(whole >= 200 * entry, s"全体の見積もりが小さすぎる: $whole")
+      assert(part >= 50 * entry && part < whole / 2, s"一部の見積もり: $part / $whole")
+      assertEquals(none, 0L)
+      assertEquals(live, 50 * entry)
+      assert(over > 1000L, s"上限を超えたら上限より大きい値: $over")
+      assertEquals(dead, 501L) // 墓石だけを上限まで読んで打ち切る
+  }
